@@ -31,13 +31,11 @@
 #include <sys/mman.h>
 #include <sys/poll.h>
 #include <sys/select.h>
+#include <sys/system_properties.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <wchar.h>
-
-#define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
-#include <sys/_system_properties.h>
 
 #include <map>
 #include <memory>
@@ -48,7 +46,6 @@
 #include <thread>
 #include <vector>
 
-#include <InitProperties.sysprop.h>
 #include <android-base/chrono_utils.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
@@ -103,33 +100,21 @@ using android::properties::BuildTrie;
 using android::properties::ParsePropertyInfoFile;
 using android::properties::PropertyInfoAreaFile;
 using android::properties::PropertyInfoEntry;
-using android::sysprop::InitProperties::is_userspace_reboot_supported;
 
 namespace android {
 namespace init {
-
-class PersistWriteThread;
-
-constexpr auto FINGERPRINT_PROP = "ro.build.fingerprint";
-constexpr auto LEGACY_FINGERPRINT_PROP = "ro.build.legacy.fingerprint";
-constexpr auto ID_PROP = "ro.build.id";
-constexpr auto LEGACY_ID_PROP = "ro.build.legacy.id";
-constexpr auto VBMETA_DIGEST_PROP = "ro.boot.vbmeta.digest";
-constexpr auto DIGEST_SIZE_USED = 8;
 
 static bool persistent_properties_loaded = false;
 
 static int from_init_socket = -1;
 static int init_socket = -1;
 static bool accept_messages = false;
-static std::mutex accept_messages_lock;
-static std::mutex selinux_check_access_lock;
-static std::thread property_service_thread;
-static std::thread property_service_for_system_thread;
+[[clang::no_destroy]] static std::mutex accept_messages_lock;
+[[clang::no_destroy]] static std::mutex selinux_check_access_lock;
+[[clang::no_destroy]] static std::thread property_service_thread;
+[[clang::no_destroy]] static std::thread property_service_for_system_thread;
 
-static std::unique_ptr<PersistWriteThread> persist_write_thread;
-
-static PropertyInfoAreaFile property_info_area;
+[[clang::no_destroy]] static PropertyInfoAreaFile property_info_area;
 
 struct PropertyAuditData {
     const ucred* cr;
@@ -391,6 +376,8 @@ class PersistWriteThread {
     std::deque<std::tuple<std::string, std::string, SocketConnection>> work_;
 };
 
+[[clang::no_destroy]] static std::unique_ptr<PersistWriteThread> persist_write_thread;
+
 static std::optional<uint32_t> PropertySet(const std::string& name, const std::string& value,
                                            SocketConnection* socket, std::string* error) {
     size_t valuelen = value.size();
@@ -456,6 +443,10 @@ static uint32_t SendControlMessage(const std::string& msg, const std::string& na
                                    SocketConnection* socket, std::string* error) {
     auto lock = std::lock_guard{accept_messages_lock};
     if (!accept_messages) {
+        // If we're already shutting down and you're asking us to stop something,
+        // just say we did (https://issuetracker.google.com/336223505).
+        if (msg == "stop") return PROP_SUCCESS;
+
         *error = "Received control message after shutdown, ignoring";
         return PROP_ERROR_HANDLE_CONTROL_MESSAGE;
     }
@@ -568,8 +559,8 @@ std::optional<uint32_t> HandlePropertySet(const std::string& name, const std::st
         }
         LOG(INFO) << "Received sys.powerctl='" << value << "' from pid: " << cr.pid
                   << process_log_string;
-        if (value == "reboot,userspace" && !is_userspace_reboot_supported().value_or(false)) {
-            *error = "Userspace reboot is not supported by this device";
+        if (value == "reboot,userspace") {
+            *error = "Userspace reboot is deprecated.";
             return {PROP_ERROR_INVALID_VALUE};
         }
     }
@@ -579,7 +570,7 @@ std::optional<uint32_t> HandlePropertySet(const std::string& name, const std::st
     // We use a thread to do this restorecon operation to prevent holding up init, as it may take
     // a long time to complete.
     if (name == kRestoreconProperty && cr.pid != 1 && !value.empty()) {
-        static AsyncRestorecon async_restorecon;
+        [[clang::no_destroy]] static AsyncRestorecon async_restorecon;
         async_restorecon.TriggerRestorecon(value);
         return {PROP_SUCCESS};
     }
@@ -598,7 +589,7 @@ uint32_t HandlePropertySetNoSocket(const std::string& name, const std::string& v
 }
 
 static void handle_property_set_fd(int fd) {
-    static constexpr uint32_t kDefaultSocketTimeout = 2000; /* ms */
+    static constexpr uint32_t kDefaultSocketTimeout = 5000; /* ms */
 
     int s = accept4(fd, nullptr, nullptr, SOCK_CLOEXEC);
     if (s == -1) {
@@ -848,13 +839,16 @@ static void LoadPropertiesFromSecondStageRes(std::map<std::string, std::string>*
 // So we need to apply the same rule of build/make/tools/post_process_props.py
 // on runtime.
 static void update_sys_usb_config() {
-    bool is_eng = !android::base::GetBoolProperty("ro.adb.secure", true);
+    // emulators don't have USB, they enable adb another way.
+    const bool add_adb_func = !android::base::GetBoolProperty("ro.adb.secure", true) &&
+                              android::base::GetBoolProperty("ro.adb.has_usb", true);
+
     std::string config = android::base::GetProperty("persist.sys.usb.config", "");
     // b/150130503, add (config == "none") condition here to prevent appending
     // ",adb" if "none" is explicitly defined in default prop.
     if (config.empty() || config == "none") {
-        InitPropertySet("persist.sys.usb.config", is_eng ? "adb" : "none");
-    } else if (is_eng && config.find("adb") == std::string::npos &&
+        InitPropertySet("persist.sys.usb.config", add_adb_func ? "adb" : "none");
+    } else if (add_adb_func && config.find("adb") == std::string::npos &&
                config.length() + 4 < PROP_VALUE_MAX) {
         config.append(",adb");
         InitPropertySet("persist.sys.usb.config", config);
@@ -942,78 +936,33 @@ static void property_initialize_ro_product_props() {
             }
         }
     }
-}
 
-static void property_initialize_build_id() {
-    std::string build_id = GetProperty(ID_PROP, "");
-    if (!build_id.empty()) {
-        return;
-    }
-
-    std::string legacy_build_id = GetProperty(LEGACY_ID_PROP, "");
-    std::string vbmeta_digest = GetProperty(VBMETA_DIGEST_PROP, "");
-    if (vbmeta_digest.size() < DIGEST_SIZE_USED) {
-        LOG(ERROR) << "vbmeta digest size too small " << vbmeta_digest;
-        // Still try to set the id field in the unexpected case.
-        build_id = legacy_build_id;
-    } else {
-        // Derive the ro.build.id by appending the vbmeta digest to the base value.
-        build_id = legacy_build_id + "." + vbmeta_digest.substr(0, DIGEST_SIZE_USED);
-    }
-
-    std::string error;
-    auto res = PropertySetNoSocket(ID_PROP, build_id, &error);
-    if (res != PROP_SUCCESS) {
-        LOG(ERROR) << "Failed to set " << ID_PROP << " to " << build_id;
+    // ro.build.product property is obsolete and replaced with ro.product.device, but define it for
+    // the compatibility with old features.
+    std::string device_name = GetProperty("ro.product.device", EMPTY);
+    if (GetProperty("ro.build.product", EMPTY).empty() && !device_name.empty()) {
+        std::string error;
+        auto res = PropertySetNoSocket("ro.build.product", device_name, &error);
+        if (res != PROP_SUCCESS) {
+            LOG(ERROR) << "Failed to set ro.build.product to " << device_name << ": err=" << res
+                       << " (" << error << ")";
+        }
     }
 }
 
-static std::string ConstructBuildFingerprint(bool legacy) {
-    const std::string UNKNOWN = "unknown";
-    std::string build_fingerprint = GetProperty("ro.product.brand", UNKNOWN);
-    build_fingerprint += '/';
-    build_fingerprint += GetProperty("ro.product.name", UNKNOWN);
-    build_fingerprint += '/';
-    build_fingerprint += GetProperty("ro.product.device", UNKNOWN);
-    build_fingerprint += ':';
-    build_fingerprint += GetProperty("ro.build.version.release_or_codename", UNKNOWN);
-    build_fingerprint += '/';
-
-    std::string build_id =
-            legacy ? GetProperty(LEGACY_ID_PROP, UNKNOWN) : GetProperty(ID_PROP, UNKNOWN);
-    build_fingerprint += build_id;
-    build_fingerprint += '/';
-    build_fingerprint += GetProperty("ro.build.version.incremental", UNKNOWN);
-    build_fingerprint += ':';
-    build_fingerprint += GetProperty("ro.build.type", UNKNOWN);
-    build_fingerprint += '/';
-    build_fingerprint += GetProperty("ro.build.tags", UNKNOWN);
-
-    return build_fingerprint;
-}
-
-// Derive the legacy build fingerprint if we overwrite the build id at runtime.
-static void property_derive_legacy_build_fingerprint() {
-    std::string legacy_build_fingerprint = GetProperty(LEGACY_FINGERPRINT_PROP, "");
-    if (!legacy_build_fingerprint.empty()) {
+static void initialize_microdroid_properties(std::map<std::string, std::string>* properties) {
+    if (properties == NULL || !IsMicrodroid()) {
         return;
     }
 
-    // The device doesn't have a legacy build id, skipping the legacy fingerprint.
-    std::string legacy_build_id = GetProperty(LEGACY_ID_PROP, "");
-    if (legacy_build_id.empty()) {
+    char hostname_cstr[HOST_NAME_MAX];
+    if (gethostname(hostname_cstr, sizeof(hostname_cstr)) != 0) {
+        PLOG(ERROR) << "Failed to gethostname";
         return;
     }
-
-    legacy_build_fingerprint = ConstructBuildFingerprint(true /* legacy fingerprint */);
-    LOG(INFO) << "Setting property '" << LEGACY_FINGERPRINT_PROP << "' to '"
-              << legacy_build_fingerprint << "'";
-
-    std::string error;
-    auto res = PropertySetNoSocket(LEGACY_FINGERPRINT_PROP, legacy_build_fingerprint, &error);
-    if (res != PROP_SUCCESS) {
-        LOG(ERROR) << "Error setting property '" << LEGACY_FINGERPRINT_PROP << "': err=" << res
-                   << " (" << error << ")";
+    const std::string hostname(hostname_cstr);
+    if (hostname != "localhost") {
+        (*properties)["ro.product.name"] = hostname;
     }
 }
 
@@ -1024,14 +973,41 @@ static void property_derive_build_fingerprint() {
         return;
     }
 
-    build_fingerprint = ConstructBuildFingerprint(false /* legacy fingerprint */);
-    LOG(INFO) << "Setting property '" << FINGERPRINT_PROP << "' to '" << build_fingerprint << "'";
+    const std::string UNKNOWN = "unknown";
+    build_fingerprint = GetProperty("ro.product.brand", UNKNOWN);
+    build_fingerprint += '/';
+    build_fingerprint += GetProperty("ro.product.name", UNKNOWN);
+
+    // should be set in /product/etc/build.prop
+    // when we have a dev option device, and we've switched the kernel to 16kb mode
+    // we use the same system image, but we've switched out the kernel, so make it
+    // visible at a high level
+    bool has16KbDevOption =
+            android::base::GetBoolProperty("ro.product.build.16k_page.enabled", false);
+    if (has16KbDevOption && getpagesize() == 16384) {
+        build_fingerprint += "_16kb";
+    }
+
+    build_fingerprint += '/';
+    build_fingerprint += GetProperty("ro.product.device", UNKNOWN);
+    build_fingerprint += ':';
+    build_fingerprint += GetProperty("ro.build.version.release_or_codename", UNKNOWN);
+    build_fingerprint += '/';
+    build_fingerprint += GetProperty("ro.build.id", UNKNOWN);
+    build_fingerprint += '/';
+    build_fingerprint += GetProperty("ro.build.version.incremental", UNKNOWN);
+    build_fingerprint += ':';
+    build_fingerprint += GetProperty("ro.build.type", UNKNOWN);
+    build_fingerprint += '/';
+    build_fingerprint += GetProperty("ro.build.tags", UNKNOWN);
+
+    LOG(INFO) << "Setting property 'ro.build.fingerprint' to '" << build_fingerprint << "'";
 
     std::string error;
-    auto res = PropertySetNoSocket(FINGERPRINT_PROP, build_fingerprint, &error);
+    auto res = PropertySetNoSocket("ro.build.fingerprint", build_fingerprint, &error);
     if (res != PROP_SUCCESS) {
-        LOG(ERROR) << "Error setting property '" << FINGERPRINT_PROP << "': err=" << res << " ("
-                   << error << ")";
+        LOG(ERROR) << "Error setting property 'ro.build.fingerprint': err=" << res << " (" << error
+                   << ")";
     }
 }
 
@@ -1103,6 +1079,12 @@ static void property_initialize_ro_vendor_api_level() {
     // required to support.
     constexpr auto VENDOR_API_LEVEL_PROP = "ro.vendor.api_level";
 
+    if (__system_property_find(VENDOR_API_LEVEL_PROP) != nullptr) {
+        // The device already have ro.vendor.api_level in its vendor/build.prop.
+        // Skip initializing the ro.vendor.api_level property.
+        return;
+    }
+
     auto vendor_api_level = GetIntProperty("ro.board.first_api_level", __ANDROID_VENDOR_API_MAX__);
     if (vendor_api_level != __ANDROID_VENDOR_API_MAX__) {
         // Update the vendor_api_level with "ro.board.api_level" only if both "ro.board.api_level"
@@ -1131,6 +1113,52 @@ static void property_initialize_ro_vendor_api_level() {
     if (res != PROP_SUCCESS) {
         LOG(ERROR) << "Failed to set " << VENDOR_API_LEVEL_PROP << " with " << vendor_api_level
                    << ": " << error << "(" << res << ")";
+    }
+}
+
+static void SetSafetyNetProps() {
+    std::string error;
+    uint32_t res;
+
+    const std::pair<const char*, const char*> props[] = {
+        {"ro.boot.flash.locked", "1"},
+        {"ro.boot.vbmeta.device_state", "locked"},
+        {"ro.boot.verifiedbootstate", "green"},
+        {"ro.boot.veritymode", "enforcing"},
+        {"ro.boot.warranty_bit", "0"},
+        {"ro.warranty_bit", "0"},
+        {"ro.debuggable", "0"},
+        {"ro.force.debuggable", "0"},
+        {"ro.adb.secure", "1"},
+        {"ro.secure", "1"},
+        {"ro.bootimage.build.type", "user"},
+        {"ro.build.type", "user"},
+        {"ro.build.keys", "release-keys"},
+        {"ro.build.tags", "release-keys"},
+        {"ro.system.build.tags", "release-keys"},
+        {"ro.product.build.type", "user"},
+        {"ro.system_dlkm.build.type", "user"},
+        {"ro.odm.build.type", "user"},
+        {"ro.system.build.type", "user"},
+        {"ro.system_ext.build.type", "user"},
+        {"ro.vendor.build.type", "user"},
+        {"ro.vendor_dlkm.build.type", "user"},
+        {"ro.vendor.boot.warranty_bit", "0"},
+        {"ro.vendor.warranty_bit", "0"},
+        {"vendor.boot.vbmeta.device_state", "locked"},
+        {"vendor.boot.verifiedbootstate", "green"},
+        {"oplusboot.verifiedbootstate", "green"},
+        {"sys.oem_unlock_allowed", "0"}
+    };
+
+    for (const auto& [name, value] : props) {
+        res = PropertySetNoSocket(name, value, &error);
+        if (res == PROP_SUCCESS) {
+            LOG(INFO) << "Property '" << name << "' set successfully to '" << value << "'";
+        } else {
+            LOG(ERROR) << "Failed to set property '" << name
+                       << "' to '" << value << "': err=" << res << " (" << error << ")";
+        }
     }
 }
 
@@ -1219,6 +1247,7 @@ void PropertyLoadBootDefaults() {
         }
     }
 
+    initialize_microdroid_properties(&properties);
     for (const auto& [name, value] : properties) {
         std::string error;
         if (PropertySetNoSocket(name, value, &error) != PROP_SUCCESS) {
@@ -1234,19 +1263,34 @@ void PropertyLoadBootDefaults() {
     vendor_load_properties();
 
     property_initialize_ro_product_props();
-    property_initialize_build_id();
     property_derive_build_fingerprint();
-    property_derive_legacy_build_fingerprint();
     property_initialize_ro_cpu_abilist();
     property_initialize_ro_vendor_api_level();
+
+    // Report a valid verified boot chain to make Google SafetyNet integrity
+    // checks pass. This needs to be done before parsing the kernel cmdline as
+    // these properties are read-only and will be set to invalid values with
+    // androidboot cmdline arguments.
+    if (SPOOF_SAFETYNET) {
+      if (!IsRecoveryMode()) {
+        SetSafetyNetProps();
+      }
+    }
 
     // Restore the normal property override security after init extension is executed
     weaken_prop_override_security = false;
 
     update_sys_usb_config();
+}
 
-    // Restore the normal property override security after init extension is executed
-    weaken_prop_override_security = false;
+void PropertyLoadDerivedDefaults() {
+    const char* PAGE_PROP = "ro.boot.hardware.cpu.pagesize";
+    if (GetProperty(PAGE_PROP, "").empty()) {
+        std::string error;
+        if (PropertySetNoSocket(PAGE_PROP, std::to_string(getpagesize()), &error) != PROP_SUCCESS) {
+            LOG(ERROR) << "Could not set '" << PAGE_PROP << "' because: " << error;
+        }
+    }
 }
 
 bool LoadPropertyInfoFromFile(const std::string& filename,
@@ -1317,12 +1361,14 @@ void CreateSerializedPropertyInfo() {
     }
     selinux_android_restorecon(PROP_TREE_FILE, 0);
 
+#ifdef WRITE_APPCOMPAT_OVERRIDE_SYSTEM_PROPERTIES
     mkdir(APPCOMPAT_OVERRIDE_PROP_FOLDERNAME, S_IRWXU | S_IXGRP | S_IXOTH);
     if (!WriteStringToFile(serialized_contexts, APPCOMPAT_OVERRIDE_PROP_TREE_FILE, 0444, 0, 0,
                            false)) {
         PLOG(ERROR) << "Unable to write appcompat override property infos to file";
     }
     selinux_android_restorecon(APPCOMPAT_OVERRIDE_PROP_TREE_FILE, 0);
+#endif
 }
 
 static void ExportKernelBootProps() {
@@ -1392,37 +1438,6 @@ static void ProcessBootconfig() {
     });
 }
 
-static void SetSafetyNetProps() {
-    InitPropertySet("ro.boot.flash.locked", "1");
-    InitPropertySet("ro.boot.vbmeta.device_state", "locked");
-    InitPropertySet("ro.boot.verifiedbootstate", "green");
-    InitPropertySet("ro.boot.veritymode", "enforcing");
-    InitPropertySet("ro.boot.warranty_bit", "0");
-    InitPropertySet("ro.warranty_bit", "0");
-    InitPropertySet("ro.debuggable", "0");
-    InitPropertySet("ro.force.debuggable", "0");
-    InitPropertySet("ro.adb.secure", "1");
-    InitPropertySet("ro.secure", "1");
-    InitPropertySet("ro.bootimage.build.type", "user");
-    InitPropertySet("ro.build.type", "user");
-    InitPropertySet("ro.build.keys", "release-keys");
-    InitPropertySet("ro.build.tags", "release-keys");
-    InitPropertySet("ro.system.build.tags", "release-keys");
-    InitPropertySet("ro.product.build.type", "user");
-    InitPropertySet("ro.odm.build.type", "user");
-    InitPropertySet("ro.system.build.type", "user");
-    InitPropertySet("ro.system_ext.build.type", "user");
-    InitPropertySet("ro.vendor.build.type", "user");
-    InitPropertySet("ro.vendor_dlkm.build.type", "user");
-    InitPropertySet("ro.vendor.boot.warranty_bit", "0");
-    InitPropertySet("ro.vendor.warranty_bit", "0");
-    InitPropertySet("vendor.boot.vbmeta.device_state", "locked");
-    InitPropertySet("vendor.boot.verifiedbootstate", "green");
-    InitPropertySet("oplusboot.verifiedbootstate", "green");
-    InitPropertySet("sys.oem_unlock_allowed", "0");
-    InitPropertySet("ro.crypto.state", "encrypted");
-}
-
 void PropertyInit() {
     selinux_callback cb;
     cb.func_audit = PropertyAuditCallback;
@@ -1437,27 +1452,20 @@ void PropertyInit() {
         LOG(FATAL) << "Failed to load serialized property info file";
     }
 
-    // Report a valid verified boot chain to make Google SafetyNet integrity
-    // checks pass. This needs to be done before parsing the kernel cmdline as
-    // these properties are read-only and will be set to invalid values with
-    // androidboot cmdline arguments.
-    if (SPOOF_SAFETYNET) {
-      if (!IsRecoveryMode()) {
-        SetSafetyNetProps();
-      }
-    }
-
     // If arguments are passed both on the command line and in DT,
     // properties set in DT always have priority over the command-line ones.
     ProcessKernelDt();
-    ProcessKernelCmdline();
     ProcessBootconfig();
+    ProcessKernelCmdline();
+
+    vendor_process_bootenv();
 
     // Propagate the kernel variables to internal variables
     // used by init as well as the current required properties.
     ExportKernelBootProps();
 
     PropertyLoadBootDefaults();
+    PropertyLoadDerivedDefaults();
 }
 
 static void HandleInitSocket() {
