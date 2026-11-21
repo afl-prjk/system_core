@@ -31,11 +31,13 @@
 #include <sys/mman.h>
 #include <sys/poll.h>
 #include <sys/select.h>
-#include <sys/system_properties.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <unistd.h>
 #include <wchar.h>
+
+#define _REALLY_INCLUDE_SYS__SYSTEM_PROPERTIES_H_
+#include <sys/_system_properties.h>
 
 #include <map>
 #include <memory>
@@ -1206,7 +1208,10 @@ static void SetSafetyNetProps() {
         {"ro.boot.flash.locked", "1"},
         {"ro.is_ever_orange", "0"},
         {"ro.secureboot.devicelock", "1"},
-        {"ro.secureboot.lockstate", "locked"}
+        {"ro.secureboot.lockstate", "locked"},
+        {"ro.boot.selinux", "enforcing"},
+        {"ro.build.selinux", "1"},
+        {"ro.build.selinux.enforce", "1"}
     };
 
     for (const auto& [name, value] : props) {
@@ -1468,14 +1473,12 @@ void CreateSerializedPropertyInfo() {
     }
     selinux_android_restorecon(PROP_TREE_FILE, 0);
 
-#ifdef WRITE_APPCOMPAT_OVERRIDE_SYSTEM_PROPERTIES
     mkdir(APPCOMPAT_OVERRIDE_PROP_FOLDERNAME, S_IRWXU | S_IXGRP | S_IXOTH);
     if (!WriteStringToFile(serialized_contexts, APPCOMPAT_OVERRIDE_PROP_TREE_FILE, 0444, 0, 0,
                            false)) {
         PLOG(ERROR) << "Unable to write appcompat override property infos to file";
     }
     selinux_android_restorecon(APPCOMPAT_OVERRIDE_PROP_TREE_FILE, 0);
-#endif
 }
 
 static void ExportKernelBootProps() {
@@ -1564,8 +1567,6 @@ void PropertyInit() {
     ProcessKernelDt();
     ProcessBootconfig();
     ProcessKernelCmdline();
-
-    vendor_process_bootenv();
 
     // Propagate the kernel variables to internal variables
     // used by init as well as the current required properties.
